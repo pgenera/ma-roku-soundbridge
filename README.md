@@ -14,7 +14,7 @@ Zero external Python dependencies (`requirements: []` — pure `asyncio` TCP).
   - Defaults new SoundBridge players to **MP3** with **basic ICY** in-stream metadata (~3s click-to-audio, reliable continuous flow streaming, live track/artist updates on the VFD display).
   - Also supports uncompressed **WAV** via player audio settings, automatically falling back to RCP `SetWorkingSongInfo` metadata pushes.
   - Subscribes to Music Assistant queue updates so track/artist display updates are pushed immediately on track transitions, plus total duration (`trackLength`) for single-track playback.
-- **Full transport & power control**: Standby wake (`PlayPreset 0`) and standby power-off, volume (`0–100`), mute, play, pause, and stop, with a buffering grace window that suppresses false `stop` transitions while the device fills its initial audio buffer.
+- **Full transport & power control**: Standby wake (`SetPowerState on yes`) and standby power-off, volume (`0–100`), mute, play, pause, and stop, with a buffering grace window that suppresses false `stop` transitions while the device fills its initial audio buffer.
 
 ## Installation (Music Assistant Marketplace)
 
