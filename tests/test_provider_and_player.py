@@ -285,8 +285,7 @@ async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
     assert player.current_media.queue_item_id == "qi_1"
 
     mock_client.play_url.reset_mock()
-    queue.items = 2
-    queue.current_item = SimpleNamespace(
+    track2 = SimpleNamespace(
         name="Freddie Freeloader",
         duration=589,
         media_item=SimpleNamespace(
@@ -295,6 +294,42 @@ async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
             album=SimpleNamespace(name="Kind of Blue"),
         ),
     )
+    track3 = SimpleNamespace(
+        name="Blue in Green",
+        duration=337,
+        media_item=SimpleNamespace(
+            name="Blue in Green",
+            artists=[SimpleNamespace(name="Miles Davis")],
+            album=SimpleNamespace(name="Kind of Blue"),
+        ),
+    )
+    queue.items = 3
+    queue.current_index = 1
+    queue.current_item = track2
+    mass.player_queues.items.return_value = [track2, track3]
+    await player.play_media(media)
+    mock_client.play_url.assert_awaited_once_with(
+        "http://192.168.1.10:8097/flow/session/item.mp3",
+        title="Kind of Blue",
+        artist="",
+        album="",
+        fmt="MP3",
+        length_ms=None,
+    )
+
+    mock_client.play_url.reset_mock()
+    other_album_track = SimpleNamespace(
+        name="Pharaoh's Dance",
+        duration=1200,
+        media_item=SimpleNamespace(
+            name="Pharaoh's Dance",
+            artists=[SimpleNamespace(name="Miles Davis")],
+            album=SimpleNamespace(name="Bitches Brew"),
+        ),
+    )
+    queue.items = 2
+    queue.current_index = 0
+    mass.player_queues.items.return_value = [track2, other_album_track]
     await player.play_media(media)
     mock_client.play_url.assert_awaited_once_with(
         "http://192.168.1.10:8097/flow/session/item.mp3",

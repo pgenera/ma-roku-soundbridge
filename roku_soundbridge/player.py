@@ -258,11 +258,12 @@ class SoundBridgePlayer(PlayerProtocol):
 
         # When ICY StreamTitle arrives, SoundBridge firmware shifts the initial
         # working `title` into `artist` (VFD line 2) and places ICY StreamTitle on
-        # `title` (VFD line 1). Seeding initial `title` with the album (for single
-        # tracks) or "Music Assistant" (for multi-track flows) gives a clean 2-line
-        # VFD readout without stale track titles on line 2.
+        # `title` (VFD line 1). Seeding initial `title` with the shared album (for
+        # single tracks or full-album queues) or "Music Assistant" (for mixed-album
+        # flows) gives a clean 2-line VFD readout without stale album metadata.
         if use_icy:
-            title = (queue_album or "Music Assistant") if is_single_item else "Music Assistant"
+            uniform_album = self._uniform_queue_album(self._get_active_queue(), queue_album)
+            title = uniform_album or "Music Assistant"
             artist = ""
             album = ""
         else:
@@ -379,13 +380,47 @@ class SoundBridgePlayer(PlayerProtocol):
             self._attr_elapsed_time_last_updated = None
             self._attr_current_media = None
 
-    def _current_queue_track_metadata(self) -> tuple[str, str, str, int | None, bool]:
-        """Return (title, artist, album, duration_seconds, is_single_item) for the active queue."""
-        queue = (
+    def _get_active_queue(self) -> Any | None:
+        """Return the active PlayerQueue for this player, if any."""
+        return (
             self.mass.players.get_active_queue(self.player)
             if self.player is not None
             else self.mass.player_queues.get_active_queue(self.protocol_id)
         )
+
+    def _uniform_queue_album(self, queue: Any | None, fallback_album: str) -> str:
+        """
+        Return the shared album name when all remaining queue items match it.
+
+        :param queue: Active PlayerQueue instance or mock.
+        :param fallback_album: Current track's resolved album name.
+        :return: Shared album name for single tracks or full-album queues, else ``""``.
+        """
+        if not queue or not fallback_album:
+            return ""
+        if queue.items <= 1:
+            return fallback_album
+        items_fn = getattr(self.mass.player_queues, "items", None)
+        offset = getattr(queue, "current_index", None) or 0
+        remaining = (
+            items_fn(queue.queue_id, limit=max(queue.items - offset, 1), offset=offset)
+            if callable(items_fn)
+            else None
+        )
+        if not isinstance(remaining, list) or not remaining:
+            return ""
+        for idx, qi in enumerate(remaining):
+            qi_media = getattr(qi, "media_item", None)
+            qi_album = getattr(getattr(qi_media, "album", None), "name", None) or (
+                fallback_album if idx == 0 else ""
+            )
+            if qi_album != fallback_album:
+                return ""
+        return fallback_album
+
+    def _current_queue_track_metadata(self) -> tuple[str, str, str, int | None, bool]:
+        """Return (title, artist, album, duration_seconds, is_single_item) for the active queue."""
+        queue = self._get_active_queue()
         if not queue or not queue.current_item:
             return "", "", "", None, False
         item = queue.current_item
