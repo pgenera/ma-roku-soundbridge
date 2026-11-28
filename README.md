@@ -11,10 +11,10 @@ Zero external Python dependencies (`requirements: []` — pure `asyncio` TCP).
   - **Automatic Bonjour / mDNS discovery** (`_roku-rcp._tcp.local.`) on the local subnet.
   - **Manual host list** (`host` or `host:port`, default port `5555`) for SoundBridges across VLANs/subnets where multicast mDNS does not reach, automatically deduplicated against mDNS-discovered devices.
 - **Fast MP3 + ICY streaming by default**:
-  - Defaults new SoundBridge players to **MP3** with **basic ICY** in-stream metadata (~3s click-to-audio, reliable continuous flow streaming, live track/artist updates on the VFD display).
-  - Also supports uncompressed **WAV** via player audio settings, automatically falling back to RCP `SetWorkingSongInfo` metadata pushes.
-  - Subscribes to Music Assistant queue updates so track/artist display updates are pushed immediately on track transitions, plus total duration (`trackLength`) for single-track playback.
-- **Full transport & power control**: Standby wake (`SetPowerState on yes`) and standby power-off, volume (`0–100`), mute, play, pause, and stop, with a buffering grace window that suppresses false `stop` transitions while the device fills its initial audio buffer.
+  - Defaults new SoundBridge players to **MP3** with **basic ICY** in-stream metadata (~3s click-to-audio, reliable continuous flow streaming, live track/artist updates on VFD line 1 and album/source on line 2).
+  - Also supports uncompressed **WAV** via player audio settings, seeding RCP `SetWorkingSongInfo` metadata (`title`, `artist`, and `album` for single tracks).
+  - Sends total duration (`trackLength`) for single-track playback so single-item progress displays accurately without locking stale duration on multi-track flows.
+- **Full transport & power control**: Standby wake (`SetPowerState on no` with automatic `Internet Radio` source connect) and standby power-off, volume (`0–100`), mute, play, pause, and stop, with a buffering grace window that suppresses false `stop`/`connecting` transitions while the device fills its initial audio buffer.
 
 ## Installation (Music Assistant Marketplace)
 

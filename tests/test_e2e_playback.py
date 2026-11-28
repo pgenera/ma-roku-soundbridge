@@ -67,19 +67,23 @@ async def _await_stop(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> str:
-    """Ensure the device is idle and return ``"standby"`` or ``"stop"``."""
+    """Ensure the device is idle and return ``"standby"``, ``"disconnected"``, or ``"stop"``."""
     state = await _rcp_query(reader, writer, "GetTransportState")
     if "Standby" in state:
         return "standby"
+    if "Disconnected" in state:
+        return "disconnected"
     await _rcp_query(reader, writer, "Stop")
     for _ in range(30):
         state = await _rcp_query(reader, writer, "GetTransportState")
         if "Standby" in state:
             return "standby"
+        if "Disconnected" in state:
+            return "disconnected"
         if "Stop" in state:
             return "stop"
         await asyncio.sleep(0.1)
-    msg = f"device did not reach Stop/Standby within 3s (last={state!r})"
+    msg = f"device did not reach Stop/Standby/Disconnected within 3s (last={state!r})"
     raise AssertionError(msg)
 
 
@@ -211,6 +215,7 @@ async def test_e2e_play_a_track() -> None:
         assert expected_title in info, f"expected title {expected_title!r} in:\n{info}"
         if expected_artist:
             assert expected_artist in info, f"expected artist {expected_artist!r} in:\n{info}"
+        assert "artist:" in info, f"expected line-2 artist field in:\n{info}"
     finally:
         try:
             rcp_w.write(b"Stop\r\n")

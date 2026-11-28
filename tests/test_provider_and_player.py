@@ -9,12 +9,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 from music_assistant_models.enums import (
     ContentType,
-    EventType,
     IdentifierType,
     MediaType,
     PlaybackState,
 )
-from music_assistant_models.event import MassEvent
 from music_assistant_models.player import PlayerMedia
 from zeroconf import ServiceStateChange
 
@@ -184,8 +182,8 @@ def _assert_mp3_default(player: SoundBridgePlayer, by_key: dict[str, Any]) -> No
         assert player.default_playback_quality == _PLAYBACK_QUALITY.COMPRESSED
 
 
-async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
-    """SoundBridgePlayer defaults to MP3+basic ICY, skips RCP title on MP3, and pushes WAV metadata."""
+async def _make_player_with_mock_client() -> tuple[SoundBridgePlayer, MagicMock, MagicMock]:
+    """Build a SoundBridgePlayer with a mocked RcpClient and parent player."""
     provider, mass = _make_mock_provider()
     await provider.handle_async_init()
 
@@ -211,9 +209,20 @@ async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
     mock_client.album = ""
     mock_client.duration = 0
     mock_client.connect = AsyncMock(return_value=True)
+    mock_client.ensure_ready_for_playback = AsyncMock(return_value=True)
     mock_client.play_url = AsyncMock()
-    mock_client.set_working_song_info = AsyncMock()
+    mock_client.stop = AsyncMock()
     player._client = mock_client
+
+    parent_player = MagicMock()
+    parent_player.player_id = "ma_player_1"
+    player._player = parent_player
+    return player, mock_client, mass
+
+
+async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
+    """SoundBridgePlayer defaults to MP3+basic ICY, seeds line 2 cleanly, and supports WAV."""
+    player, mock_client, mass = await _make_player_with_mock_client()
 
     entries = await player.get_config_entries()
     by_key = {entry.key: entry for entry in entries}
@@ -231,10 +240,6 @@ async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
     )
     assert (IdentifierType.MAC_ADDRESS, "00:0D:4B:AA:BB:CC") in player.identifiers
 
-    parent_player = MagicMock()
-    parent_player.player_id = "ma_player_1"
-    player._player = parent_player
-
     queue = SimpleNamespace(
         queue_id="ma_player_1",
         items=1,
@@ -244,6 +249,7 @@ async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
             media_item=SimpleNamespace(
                 name="So What",
                 artists=[SimpleNamespace(name="Miles Davis")],
+                album=SimpleNamespace(name="Kind of Blue"),
             ),
         ),
     )
@@ -252,18 +258,33 @@ async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
     mass.streams.resolve_stream_url = AsyncMock(
         return_value="http://192.168.1.10:8097/flow/session/item.mp3"
     )
-    media = PlayerMedia(uri="library://track/1", media_type=MediaType.TRACK)
+    media = PlayerMedia(
+        uri="library://track/1",
+        media_type=MediaType.TRACK,
+        source_id="ma_player_1",
+        queue_item_id="qi_1",
+    )
     await player.play_media(media)
+    mock_client.ensure_ready_for_playback.assert_awaited_once()
     mock_client.play_url.assert_awaited_once_with(
         "http://192.168.1.10:8097/flow/session/item.mp3",
-        title="",
+        title="Kind of Blue",
         artist="",
+        album="",
         fmt="MP3",
         length_ms=210000,
     )
     assert player.playback_state == PlaybackState.PLAYING
 
-    # Queue advances to track 2 of 2: QUEUE_UPDATED immediately pushes new title/artist via RCP
+    mock_client.transport_state = "play"
+    mock_client.position = 12
+    player._sync_client_state()
+    assert player.current_media is not None
+    assert player.current_media.uri == "library://track/1"
+    assert player.current_media.source_id == "ma_player_1"
+    assert player.current_media.queue_item_id == "qi_1"
+
+    mock_client.play_url.reset_mock()
     queue.items = 2
     queue.current_item = SimpleNamespace(
         name="Freddie Freeloader",
@@ -271,15 +292,19 @@ async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
         media_item=SimpleNamespace(
             name="Freddie Freeloader",
             artists=[SimpleNamespace(name="Miles Davis")],
+            album=SimpleNamespace(name="Kind of Blue"),
         ),
     )
-    await player._on_queue_event(
-        MassEvent(EventType.QUEUE_UPDATED, object_id="ma_player_1", data=queue)
+    await player.play_media(media)
+    mock_client.play_url.assert_awaited_once_with(
+        "http://192.168.1.10:8097/flow/session/item.mp3",
+        title="Music Assistant",
+        artist="",
+        album="",
+        fmt="MP3",
+        length_ms=None,
     )
-    mock_client.set_working_song_info.assert_any_await("title", "Freddie Freeloader")
-    mock_client.set_working_song_info.assert_any_await("artist", "Miles Davis")
 
-    # WAV stream with >1 queue items: pushes title & artist via RCP, omits trackLength
     mock_client.play_url.reset_mock()
     mass.streams.resolve_stream_url = AsyncMock(
         return_value="http://192.168.1.10:8097/flow/session/item.wav"
@@ -289,6 +314,7 @@ async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
         "http://192.168.1.10:8097/flow/session/item.wav",
         title="Freddie Freeloader",
         artist="Miles Davis",
+        album="",
         fmt="WAV",
         length_ms=None,
     )

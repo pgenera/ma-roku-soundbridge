@@ -22,6 +22,10 @@ class FakeRcpServer:
         self.banner = banner
         self.power_state = "on"
         self.transport_state = "stop"
+        self.active_server = "Internet Radio"
+        self.stale_connection = False
+        self.servers = ["HDHomeRun DMS", "Living Room", "Internet Radio"]
+        self.elapsed_response = "0:01:15"
         self.volume = 35
         self.mac_address = "00-0d-4b-11-22-33"
         self.received_commands: list[str] = []
@@ -73,15 +77,15 @@ class FakeRcpServer:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
-    async def _respond(self, writer: asyncio.StreamWriter, cmd: str) -> None:
-        """Send canned RCP responses matching real SoundBridge firmware."""
+    def _build_response(self, cmd: str) -> list[str]:
+        """Return canned RCP response lines matching real SoundBridge firmware."""
         lower = cmd.lower()
         canned: dict[str, list[str]] = {
             "getpowerstate": [f"GetPowerState: {self.power_state}"],
             "getmacaddress": [f"GetMACAddress: {self.mac_address}"],
             "gettransportstate": [f"GetTransportState: {self.transport_state}"],
             "getvolume": [f"GetVolume: {self.volume}"],
-            "getelapsedtime": ["GetElapsedTime: 0:01:15"],
+            "getelapsedtime": [f"GetElapsedTime: {self.elapsed_response}"],
             "gettotaltime": ["GetTotalTime: 0:04:05"],
             "getcurrentsonginfo": [
                 "GetCurrentSongInfo: title: Radio Song",
@@ -90,11 +94,38 @@ class FakeRcpServer:
                 "GetCurrentSongInfo: resource[0] url: http://127.0.0.1:8095/flow.mp3",
                 "GetCurrentSongInfo: OK",
             ],
+            "listservers": [
+                f"ListServers: ListResultSize {len(self.servers)}",
+                *(f"ListServers: {name}" for name in self.servers),
+                "ListServers: ListResultEnd",
+            ],
         }
-        if lower in canned:
-            lines = canned[lower]
-        elif lower == "setpowerstate on yes":
+        lines = canned.get(lower)
+        if lines is None:
+            lines = self._handle_dynamic_command(cmd, lower)
+        return lines
+
+    def _handle_dynamic_command(self, cmd: str, lower: str) -> list[str]:
+        """Handle stateful fake server commands."""
+        lines: list[str]
+        if lower == "getactiveserverinfo":
+            if not self.active_server or self.transport_state == "disconnected":
+                lines = ["GetActiveServerInfo: ErrorDisconnected"]
+            else:
+                lines = [
+                    "GetActiveServerInfo: Type: radio",
+                    f"GetActiveServerInfo: Name: {self.active_server}",
+                    "GetActiveServerInfo: OK",
+                ]
+        elif lower == "serverdisconnect":
+            lines = self._handle_server_disconnect()
+        elif lower.startswith("serverconnect "):
+            lines = self._handle_server_connect(int(cmd.split(None, 1)[1]))
+        elif lower in {"setpowerstate on no", "setpowerstate on yes"}:
             self.power_state = "on"
+            self.transport_state = "disconnected"
+            self.active_server = ""
+            self.stale_connection = True
             lines = ["SetPowerState: OK"]
         elif lower == "setpowerstate standby":
             self.power_state = "standby"
@@ -103,12 +134,43 @@ class FakeRcpServer:
             self.volume = int(cmd.split(None, 1)[1])
             lines = ["SetVolume: OK"]
         elif lower == "queueandplayone working":
-            self.transport_state = "play"
-            lines = ["QueueAndPlayOne: OK"]
+            lines = (
+                ["QueueAndPlayOne: ParameterError"]
+                if self.transport_state == "disconnected"
+                else ["QueueAndPlayOne: OK"]
+            )
+            if self.transport_state != "disconnected":
+                self.transport_state = "play"
         else:
-            verb = cmd.split(None, 1)[0]
-            lines = [f"{verb}: OK"]
+            lines = [f"{cmd.split(None, 1)[0]}: OK"]
+        return lines
 
+    def _handle_server_disconnect(self) -> list[str]:
+        self.stale_connection = False
+        if self.transport_state == "disconnected":
+            return ["ServerDisconnect: ErrorDisconnected"]
+        self.transport_state = "disconnected"
+        self.active_server = ""
+        return [
+            "ServerDisconnect: TransactionInitiated",
+            "ServerDisconnect: Disconnected",
+            "ServerDisconnect: TransactionComplete",
+        ]
+
+    def _handle_server_connect(self, idx: int) -> list[str]:
+        if self.stale_connection:
+            return ["ServerConnect: ConnectionFailedAlreadyConnected"]
+        self.active_server = self.servers[idx]
+        self.transport_state = "stop"
+        return [
+            "ServerConnect: TransactionInitiated",
+            "ServerConnect: Connected",
+            "ServerConnect: TransactionComplete",
+        ]
+
+    async def _respond(self, writer: asyncio.StreamWriter, cmd: str) -> None:
+        """Send canned RCP responses matching real SoundBridge firmware."""
+        lines = self._build_response(cmd)
         writer.write("".join(f"{line}\r\n" for line in lines).encode())
         await writer.drain()
 
@@ -170,7 +232,7 @@ async def test_connect_rejects_invalid_banner() -> None:
 
 
 async def test_play_url_pipelines_working_song_commands(rcp_server: FakeRcpServer) -> None:
-    """play_url sends ClearWorkingSong, SetWorkingSongInfo, and QueueAndPlayOne in order."""
+    """play_url pipelines working-song commands and sanitizes CR/LF in metadata."""
     client = RcpClient("127.0.0.1", rcp_server.port, lambda: None)
     try:
         assert await client.connect() is True
@@ -178,8 +240,9 @@ async def test_play_url_pipelines_working_song_commands(rcp_server: FakeRcpServe
 
         await client.play_url(
             "http://192.168.1.10:8097/flow/stream.wav",
-            title="Blue Train",
-            artist="John Coltrane",
+            title="Blue\nTrain",
+            artist="John\r\nColtrane",
+            album="Blue Note",
             fmt="WAV",
             length_ms=642000,
         )
@@ -196,7 +259,8 @@ async def test_play_url_pipelines_working_song_commands(rcp_server: FakeRcpServe
         assert "SetWorkingSongInfo format WAV" in rcp_server.received_commands
         assert "SetWorkingSongInfo remoteStream 1" in rcp_server.received_commands
         assert "SetWorkingSongInfo title Blue Train" in rcp_server.received_commands
-        assert "SetWorkingSongInfo artist John Coltrane" in rcp_server.received_commands
+        assert "SetWorkingSongInfo artist John  Coltrane" in rcp_server.received_commands
+        assert "SetWorkingSongInfo album Blue Note" in rcp_server.received_commands
         assert "SetWorkingSongInfo trackLength 642000" in rcp_server.received_commands
         assert "QueueAndPlayOne working" in rcp_server.received_commands
         assert client.transport_state == "play"
@@ -228,9 +292,80 @@ async def test_standby_wake_and_volume_controls(rcp_server: FakeRcpServer) -> No
                 break
             await asyncio.sleep(0.05)
 
-        assert "SetPowerState on yes" in rcp_server.received_commands
+        assert "SetPowerState on no" in rcp_server.received_commands
         assert "SetVolume 62" in rcp_server.received_commands
         assert "Mute on" in rcp_server.received_commands
         assert "SetPowerState standby" in rcp_server.received_commands
+    finally:
+        await client.disconnect()
+
+
+async def test_ensure_ready_for_playback_connects_internet_radio(
+    rcp_server: FakeRcpServer,
+) -> None:
+    """ensure_ready_for_playback wakes from standby and connects Internet Radio when Disconnected."""
+    rcp_server.power_state = "standby"
+    rcp_server.transport_state = "disconnected"
+    rcp_server.active_server = ""
+    client = RcpClient("127.0.0.1", rcp_server.port, lambda: None)
+    try:
+        assert await client.connect() is True
+        assert await client.ensure_ready_for_playback() is True
+        assert client.power_state == "on"
+        assert client.transport_state == "stop"
+        assert client.active_server_name == "Internet Radio"
+        assert "SetPowerState on no" in rcp_server.received_commands
+        assert "ServerDisconnect" in rcp_server.received_commands
+        assert "ListServers" in rcp_server.received_commands
+        assert "ServerConnect 2" in rcp_server.received_commands
+        assert rcp_server.received_commands.index(
+            "ServerDisconnect"
+        ) < rcp_server.received_commands.index("ServerConnect 2")
+    finally:
+        await client.disconnect()
+
+
+async def test_elapsed_time_ignores_generic_error(rcp_server: FakeRcpServer) -> None:
+    """GetElapsedTime: GenericError must not reset a valid cached position to zero."""
+    client = RcpClient("127.0.0.1", rcp_server.port, lambda: None)
+    try:
+        assert await client.connect() is True
+        for _ in range(30):
+            if client.position == 75:
+                break
+            await asyncio.sleep(0.05)
+        assert client.position == 75
+
+        rcp_server.elapsed_response = "GenericError"
+        await client._send_command("GetElapsedTime", wait_for_response=True)
+        assert client.position == 75
+    finally:
+        await client.disconnect()
+
+
+async def test_ensure_ready_for_playback_stale_on_cache_wakes_standby(
+    rcp_server: FakeRcpServer,
+) -> None:
+    """ensure_ready_for_playback must wake standby even when cached power_state is still 'on'."""
+    client = RcpClient("127.0.0.1", rcp_server.port, lambda: None)
+    try:
+        assert await client.connect() is True
+        for _ in range(30):
+            if client.power_state == "on":
+                break
+            await asyncio.sleep(0.05)
+        assert client.power_state == "on"
+
+        # Simulate SoundBridge entering standby externally between 5-second polls.
+        rcp_server.power_state = "standby"
+        rcp_server.transport_state = "standby"
+        rcp_server.active_server = ""
+
+        assert await client.ensure_ready_for_playback() is True
+        assert client.power_state == "on"
+        assert client.transport_state == "stop"
+        assert client.active_server_name == "Internet Radio"
+        assert "SetPowerState on no" in rcp_server.received_commands
+        assert "ServerConnect 2" in rcp_server.received_commands
     finally:
         await client.disconnect()
