@@ -25,7 +25,7 @@ Zero external Python dependencies (`requirements: []` — pure `asyncio` TCP).
 
 ## Notes & Known Hardware Limitations
 
-- **Supported codecs**: SoundBridge firmware does not decode FLAC natively and rejects WAV streams carrying ICY headers. Keep **MP3 + Basic ICY** (the automatic default) for best reliability, or switch both Output Codec to **WAV** and ICY Metadata to **Disabled** if you want uncompressed PCM.
+- **Supported codecs**: SoundBridge firmware does not decode FLAC natively and rejects WAV streams carrying ICY headers or `remoteStream 1`, while continuous `/flow/` WAV triggers probe reconnects. **MP3 + Basic ICY** is the default for gapless continuous flow mode with live VFD track updates; switching Output Codec to **WAV** (or **Lossless Uncompressed** on newer Music Assistant servers) switches to per-track lossless `/single/` playback with native VFD track, artist, album, and progress display (and automatically disables ICY framing if flow mode is forced).
 - **IPv4 only**: SoundBridge network hardware is IPv4-only.
 - **Multi-track flow duration**: In continuous queue flow mode, SoundBridge firmware locks `trackLength` when `QueueAndPlayOne` starts; total track length is therefore only sent when playing a single-item queue so multi-track queues never display a stale duration.
 

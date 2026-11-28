@@ -232,18 +232,18 @@ async def test_connect_rejects_invalid_banner() -> None:
 
 
 async def test_play_url_pipelines_working_song_commands(rcp_server: FakeRcpServer) -> None:
-    """play_url pipelines working-song commands and sanitizes CR/LF in metadata."""
+    """play_url pipelines commands, sanitizes CR/LF, and sets remoteStream only for compressed audio."""
     client = RcpClient("127.0.0.1", rcp_server.port, lambda: None)
     try:
         assert await client.connect() is True
         rcp_server.received_commands.clear()
 
         await client.play_url(
-            "http://192.168.1.10:8097/flow/stream.wav",
+            "http://192.168.1.10:8097/flow/stream.mp3",
             title="Blue\nTrain",
             artist="John\r\nColtrane",
             album="Blue Note",
-            fmt="WAV",
+            fmt="MP3",
             length_ms=642000,
         )
         for _ in range(20):
@@ -253,10 +253,10 @@ async def test_play_url_pipelines_working_song_commands(rcp_server: FakeRcpServe
 
         assert "ClearWorkingSong" in rcp_server.received_commands
         assert (
-            "SetWorkingSongInfo url http://192.168.1.10:8097/flow/stream.wav"
+            "SetWorkingSongInfo url http://192.168.1.10:8097/flow/stream.mp3"
             in rcp_server.received_commands
         )
-        assert "SetWorkingSongInfo format WAV" in rcp_server.received_commands
+        assert "SetWorkingSongInfo format MP3" in rcp_server.received_commands
         assert "SetWorkingSongInfo remoteStream 1" in rcp_server.received_commands
         assert "SetWorkingSongInfo title Blue Train" in rcp_server.received_commands
         assert "SetWorkingSongInfo artist John  Coltrane" in rcp_server.received_commands
@@ -264,6 +264,27 @@ async def test_play_url_pipelines_working_song_commands(rcp_server: FakeRcpServe
         assert "SetWorkingSongInfo trackLength 642000" in rcp_server.received_commands
         assert "QueueAndPlayOne working" in rcp_server.received_commands
         assert client.transport_state == "play"
+
+        rcp_server.received_commands.clear()
+        await client.play_url(
+            "http://192.168.1.10:8097/flow/stream.wav",
+            title="007",
+            artist="Sex Mob",
+            album="Sex Mob Does Bond",
+            fmt="WAV",
+            length_ms=155000,
+        )
+        for _ in range(20):
+            if "QueueAndPlayOne working" in rcp_server.received_commands:
+                break
+            await asyncio.sleep(0.05)
+
+        assert "SetWorkingSongInfo format WAV" in rcp_server.received_commands
+        assert "SetWorkingSongInfo remoteStream 1" not in rcp_server.received_commands
+        assert "SetWorkingSongInfo title 007" in rcp_server.received_commands
+        assert "SetWorkingSongInfo artist Sex Mob" in rcp_server.received_commands
+        assert "SetWorkingSongInfo album Sex Mob Does Bond" in rcp_server.received_commands
+        assert "SetWorkingSongInfo trackLength 155000" in rcp_server.received_commands
     finally:
         await client.disconnect()
 

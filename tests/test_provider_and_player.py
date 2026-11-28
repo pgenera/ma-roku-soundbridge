@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 from types import SimpleNamespace
 from typing import Any
@@ -353,3 +354,210 @@ async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
         fmt="WAV",
         length_ms=None,
     )
+
+
+async def test_player_wav_auto_disables_and_restores_icy() -> None:
+    """Playing WAV disables ICY automatically, switching back to MP3 restores it, and manual disable sticks."""
+    player, mock_client, mass = await _make_player_with_mock_client()
+    await player.on_config_updated()
+
+    track2 = SimpleNamespace(
+        name="Freddie Freeloader",
+        duration=589,
+        media_item=SimpleNamespace(
+            name="Freddie Freeloader",
+            artists=[SimpleNamespace(name="Miles Davis")],
+            album=SimpleNamespace(name="Kind of Blue"),
+        ),
+    )
+    track3 = SimpleNamespace(
+        name="Blue in Green",
+        duration=337,
+        media_item=SimpleNamespace(
+            name="Blue in Green",
+            artists=[SimpleNamespace(name="Miles Davis")],
+            album=SimpleNamespace(name="Kind of Blue"),
+        ),
+    )
+    queue = SimpleNamespace(
+        queue_id="ma_player_1",
+        items=2,
+        current_index=0,
+        current_item=track2,
+    )
+    mass.players.get_active_queue.return_value = queue
+    mass.player_queues.items.return_value = [track2, track3]
+
+    media = PlayerMedia(
+        uri="library://track/2",
+        media_type=MediaType.TRACK,
+        source_id="ma_player_1",
+        queue_item_id="qi_2",
+    )
+
+    # Full-album WAV disables ICY automatically and passes the shared album name.
+    mass.streams.resolve_stream_url = AsyncMock(
+        return_value="http://192.168.1.10:8097/flow/session/item.wav"
+    )
+    await player.play_media(media)
+    assert (
+        mass.config.get_protocol_value("soundbridge_192_168_1_50", CONF_ENABLE_ICY_METADATA)
+        == "disabled"
+    )
+    mock_client.play_url.assert_awaited_once_with(
+        "http://192.168.1.10:8097/flow/session/item.wav",
+        title="Freddie Freeloader",
+        artist="Miles Davis",
+        album="Kind of Blue",
+        fmt="WAV",
+        length_ms=None,
+    )
+
+    # Switching back to MP3 restores the previous ICY setting automatically.
+    mock_client.play_url.reset_mock()
+    mass.streams.resolve_stream_url = AsyncMock(
+        return_value="http://192.168.1.10:8097/flow/session/item.mp3"
+    )
+    await player.play_media(media)
+    assert (
+        mass.config.get_protocol_value("soundbridge_192_168_1_50", CONF_ENABLE_ICY_METADATA)
+        == "basic"
+    )
+    mock_client.play_url.assert_awaited_once_with(
+        "http://192.168.1.10:8097/flow/session/item.mp3",
+        title="Kind of Blue",
+        artist="",
+        album="",
+        fmt="MP3",
+        length_ms=None,
+    )
+
+    # Manual user ICY="disabled" on MP3 must not be overwritten.
+    mock_client.play_url.reset_mock()
+    mass.config.set_protocol_value("soundbridge_192_168_1_50", CONF_ENABLE_ICY_METADATA, "disabled")
+    await player.play_media(media)
+    assert (
+        mass.config.get_protocol_value("soundbridge_192_168_1_50", CONF_ENABLE_ICY_METADATA)
+        == "disabled"
+    )
+    mock_client.play_url.assert_awaited_once_with(
+        "http://192.168.1.10:8097/flow/session/item.mp3",
+        title="Freddie Freeloader",
+        artist="Miles Davis",
+        album="Kind of Blue",
+        fmt="MP3",
+        length_ms=None,
+    )
+
+
+async def test_player_wav_requires_no_flow_mode_and_enqueue_handoff() -> None:
+    """Lossless WAV disables flow mode and hands off to enqueued next track cleanly on EOF."""
+    player, mock_client, mass = await _make_player_with_mock_client()
+    tasks: list[asyncio.Task[Any]] = []
+
+    def _create_task(coro: Any) -> asyncio.Task[Any]:
+        task: asyncio.Task[Any] = asyncio.create_task(coro)
+        tasks.append(task)
+        return task
+
+    mass.create_task = _create_task
+
+    # Default MP3 uses continuous flow mode; WAV switches to per-track mode.
+    await player.on_config_updated()
+    if _CONF_OUTPUT_CODEC is not None:
+        assert player.requires_flow_mode is True
+        mass.config.set_protocol_value("soundbridge_192_168_1_50", _CONF_OUTPUT_CODEC, "wav")
+        assert player.requires_flow_mode is False
+    elif _PLAYBACK_QUALITY is not None:
+        quality_key = getattr(ma_constants, "CONF_PLAYBACK_QUALITY", "playback_quality")
+        mass.config.set_protocol_value(
+            "soundbridge_192_168_1_50",
+            quality_key,
+            _PLAYBACK_QUALITY.LOSSLESS_UNCOMPRESSED,
+        )
+        assert player.requires_flow_mode is False
+
+    track1 = SimpleNamespace(
+        queue_item_id="qi_1",
+        name="Track One",
+        duration=155,
+        media_item=SimpleNamespace(
+            name="007",
+            artists=[SimpleNamespace(name="Sex Mob")],
+            album=SimpleNamespace(name="Sex Mob Does Bond"),
+        ),
+    )
+    track2 = SimpleNamespace(
+        queue_item_id="qi_2",
+        name="Track Two",
+        duration=240,
+        media_item=SimpleNamespace(
+            name="01 - Sinfonia",
+            artists=[SimpleNamespace(name="Gabriele Santini")],
+            album=SimpleNamespace(name="Madama Butterfly"),
+        ),
+    )
+    queue = SimpleNamespace(queue_id="ma_player_1", items=2, current_index=0, current_item=track1)
+    mass.players.get_active_queue.return_value = queue
+    mass.player_queues.items.return_value = [track1, track2]
+    mass.player_queues.get_item.side_effect = lambda _qid, item_id: (
+        track1 if item_id == "qi_1" else track2
+    )
+
+    media1 = PlayerMedia(
+        uri="library://track/1",
+        media_type=MediaType.TRACK,
+        source_id="ma_player_1",
+        queue_item_id="qi_1",
+    )
+    media2 = PlayerMedia(
+        uri="library://track/2",
+        media_type=MediaType.TRACK,
+        source_id="ma_player_1",
+        queue_item_id="qi_2",
+    )
+
+    mass.streams.resolve_stream_url = AsyncMock(
+        side_effect=[
+            "http://192.168.1.10:8097/single/session/qi_1/player.wav",
+            "http://192.168.1.10:8097/single/session/qi_2/player.wav",
+        ]
+    )
+    await player.play_media(media1)
+    mock_client.play_url.assert_awaited_once_with(
+        "http://192.168.1.10:8097/single/session/qi_1/player.wav",
+        title="007",
+        artist="Sex Mob",
+        album="Sex Mob Does Bond",
+        fmt="WAV",
+        length_ms=155000,
+    )
+
+    await player.enqueue_next_media(media2)
+    mock_client.play_url.reset_mock()
+
+    # SoundBridge plays past 0s, then stops cleanly at EOF -> triggers Track 2 handoff.
+    mock_client.position = 12
+    mock_client.transport_state = "play"
+    player._sync_client_state()
+    mock_client.transport_state = "stop"
+    player._sync_client_state()
+    assert player.playback_state == PlaybackState.PLAYING
+    assert len(tasks) == 1
+    await tasks[0]
+    mock_client.play_url.assert_awaited_once_with(
+        "http://192.168.1.10:8097/single/session/qi_2/player.wav",
+        title="01 - Sinfonia",
+        artist="Gabriele Santini",
+        album="Madama Butterfly",
+        fmt="WAV",
+        length_ms=240000,
+    )
+
+    # User stop clears enqueued media so stopping never auto-advances.
+    await player.enqueue_next_media(media1)
+    await player.stop()
+    mock_client.play_url.reset_mock()
+    player._sync_client_state()
+    assert len(tasks) == 1
+    mock_client.play_url.assert_not_awaited()

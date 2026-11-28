@@ -57,6 +57,8 @@ _TRANSPORT_TO_PLAYBACK = {
 # transient "stop" or "connecting" reports during initial buffering.
 _PLAY_GRACE_SECONDS = 15
 
+_UNCOMPRESSED_FORMATS: frozenset[str] = frozenset({"WAV", "AIFF", "LPCM"})
+
 
 class SoundBridgePlayer(PlayerProtocol):
     """A Roku SoundBridge player controlled via the RCP protocol."""
@@ -95,11 +97,16 @@ class SoundBridgePlayer(PlayerProtocol):
         )
         self._last_play_url_time: float = 0.0
         self._active_media: PlayerMedia | None = None
+        self._enqueued_media: PlayerMedia | None = None
+        self._had_audio_position: bool = False
+        self._is_per_track: bool = False
+        self._saved_icy_pref: str | None = None
 
         self._attr_name = name
         self._attr_available = False
         self._attr_supported_features = {
             PlayerFeature.PLAY_MEDIA,
+            PlayerFeature.ENQUEUE,
             PlayerFeature.POWER,
             PlayerFeature.VOLUME_SET,
             PlayerFeature.VOLUME_MUTE,
@@ -120,6 +127,20 @@ class SoundBridgePlayer(PlayerProtocol):
     def poll_interval(self) -> int:
         """Return polling interval in seconds (faster while playing)."""
         return 10 if self._attr_playback_state == PlaybackState.PLAYING else 30
+
+    @property
+    def requires_flow_mode(self) -> bool:
+        """Return True for MP3 continuous flow mode, False for per-track lossless WAV."""
+        if _CONF_OUTPUT_CODEC is not None:
+            codec = self.mass.config.get_protocol_value(self.protocol_id, _CONF_OUTPUT_CODEC, "mp3")
+            return str(codec or "mp3").lower() not in {"wav", "aiff"}
+        if _PlaybackQuality is not None:
+            quality_key = getattr(ma_constants, "CONF_PLAYBACK_QUALITY", "playback_quality")
+            if (
+                quality := self.mass.config.get_protocol_value(self.protocol_id, quality_key)
+            ) is not None:
+                return str(quality).lower() != str(_PlaybackQuality.LOSSLESS_UNCOMPRESSED).lower()
+        return True
 
     @property
     def playback_quality_codecs(self) -> dict[Any, ContentType]:
@@ -159,6 +180,7 @@ class SoundBridgePlayer(PlayerProtocol):
         for key, default in defaults:
             if self.mass.config.get_protocol_value(self.protocol_id, key) is None:
                 self.mass.config.set_protocol_value(self.protocol_id, key, default)
+        self.__dict__.pop("flow_mode", None)
 
         await self._client.connect()
         self._sync_client_state()
@@ -169,6 +191,8 @@ class SoundBridgePlayer(PlayerProtocol):
         await super().on_detach()
         self._attr_available = False
         self._active_media = None
+        self._enqueued_media = None
+        self._had_audio_position = False
         await self._client.disconnect()
 
     async def on_remove(self) -> None:
@@ -229,10 +253,58 @@ class SoundBridgePlayer(PlayerProtocol):
     async def stop(self) -> None:
         """Stop playback."""
         self._active_media = None
+        self._enqueued_media = None
+        self._had_audio_position = False
+        self._is_per_track = False
         await self._client.stop()
         self._attr_playback_state = PlaybackState.IDLE
         self._attr_current_media = None
         self.update_state()
+
+    async def enqueue_next_media(self, media: PlayerMedia) -> None:
+        """
+        Store the next queue item for end-of-track handoff in per-track mode.
+
+        :param media: Next queue item's ``PlayerMedia``.
+        """
+        self._enqueued_media = media
+
+    def _sync_icy_for_format(self, fmt: str) -> str:
+        """
+        Disable ICY framing for uncompressed streams and restore it for compressed streams.
+
+        Music Assistant injects ICY metadata blocks into ``/flow/`` responses whenever
+        ``CONF_ENABLE_ICY_METADATA`` is not ``"disabled"``, which corrupts WAV/AIFF/LPCM
+        streams on SoundBridge hardware.
+
+        :param fmt: Resolved uppercase stream format token (e.g. ``MP3``, ``WAV``).
+        :return: Effective ICY metadata preference after any format adjustment.
+        """
+        raw_pref = self.mass.config.get_protocol_value(
+            self.protocol_id, CONF_ENABLE_ICY_METADATA, "basic"
+        )
+        icy_pref = str(raw_pref) if raw_pref is not None else "basic"
+        if fmt.upper() in _UNCOMPRESSED_FORMATS:
+            if icy_pref != "disabled":
+                self._saved_icy_pref = icy_pref
+                self.logger.info(
+                    "Disabling ICY metadata for %s while streaming %s "
+                    "(SoundBridge rejects ICY-framed lossless streams)",
+                    self.name,
+                    fmt,
+                )
+                self.mass.config.set_protocol_value(
+                    self.protocol_id, CONF_ENABLE_ICY_METADATA, "disabled"
+                )
+            return "disabled"
+        if self._saved_icy_pref is not None and icy_pref == "disabled":
+            restored = self._saved_icy_pref
+            self._saved_icy_pref = None
+            self.mass.config.set_protocol_value(
+                self.protocol_id, CONF_ENABLE_ICY_METADATA, restored
+            )
+            return restored
+        return icy_pref
 
     async def play_media(self, media: PlayerMedia) -> None:
         """
@@ -242,18 +314,21 @@ class SoundBridgePlayer(PlayerProtocol):
         """
         await self._client.ensure_ready_for_playback()
 
+        self._enqueued_media = None
+        self._had_audio_position = False
+
         url = await self.mass.streams.resolve_stream_url(self.protocol_id, media)
         ext = url.split("?", 1)[0].rsplit(".", 1)[-1].lower()
         fmt = {"wav": "WAV", "mp3": "MP3", "aac": "AAC", "aif": "AIFF", "aiff": "AIFF"}.get(
             ext, "WAV"
         )
+        is_per_track = "/single/" in url
+        self._is_per_track = is_per_track
 
-        queue_title, queue_artist, queue_album, queue_duration, is_single_item = (
-            self._current_queue_track_metadata()
+        queue_title, queue_artist, queue_album, queue_duration, _is_single_item = (
+            self._current_queue_track_metadata(media, allow_multi_duration=is_per_track)
         )
-        icy_pref = self.mass.config.get_protocol_value(
-            self.protocol_id, CONF_ENABLE_ICY_METADATA, "basic"
-        )
+        icy_pref = self._sync_icy_for_format(fmt)
         use_icy = fmt == "MP3" and icy_pref != "disabled"
 
         # When ICY StreamTitle arrives, SoundBridge firmware shifts the initial
@@ -261,15 +336,15 @@ class SoundBridgePlayer(PlayerProtocol):
         # `title` (VFD line 1). Seeding initial `title` with the shared album (for
         # single tracks or full-album queues) or "Music Assistant" (for mixed-album
         # flows) gives a clean 2-line VFD readout without stale album metadata.
+        uniform_album = self._uniform_queue_album(self._get_active_queue(), queue_album)
         if use_icy:
-            uniform_album = self._uniform_queue_album(self._get_active_queue(), queue_album)
             title = uniform_album or "Music Assistant"
             artist = ""
             album = ""
         else:
             title = queue_title
             artist = queue_artist
-            album = queue_album if is_single_item else ""
+            album = queue_album if is_per_track else uniform_album
 
         length_ms = int(queue_duration * 1000) if queue_duration else None
 
@@ -336,17 +411,36 @@ class SoundBridgePlayer(PlayerProtocol):
         client = self._client
         self._attr_available = client.is_connected
 
+        if client.position > 0:
+            self._had_audio_position = True
+
         if client.power_state == "standby":
             self._attr_powered = False
             self._attr_playback_state = PlaybackState.IDLE
         else:
             self._attr_powered = True
             transport = client.transport_state
-            if transport in {"stop", "connecting"} and (
-                time.time() - self._last_play_url_time < _PLAY_GRACE_SECONDS
+            if (
+                transport in {"stop", "connecting"}
+                and not self._had_audio_position
+                and (time.time() - self._last_play_url_time < _PLAY_GRACE_SECONDS)
             ):
                 transport = "buffering"
-            self._attr_playback_state = _TRANSPORT_TO_PLAYBACK.get(transport, PlaybackState.IDLE)
+            if (
+                transport == "stop"
+                and self._had_audio_position
+                and self._enqueued_media is not None
+            ):
+                next_media = self._enqueued_media
+                self._enqueued_media = None
+                self._had_audio_position = False
+                self._attr_playback_state = PlaybackState.PLAYING
+                self._last_play_url_time = time.time()
+                self.mass.create_task(self.play_media(next_media))
+            else:
+                self._attr_playback_state = _TRANSPORT_TO_PLAYBACK.get(
+                    transport, PlaybackState.IDLE
+                )
 
         self._attr_volume_level = client.volume
         self._attr_volume_muted = client.muted
@@ -359,7 +453,7 @@ class SoundBridgePlayer(PlayerProtocol):
             self._attr_elapsed_time = float(client.position)
             self._attr_elapsed_time_last_updated = client.position_updated_at or time.time()
             queue_title, queue_artist, queue_album, queue_duration, _ = (
-                self._current_queue_track_metadata()
+                self._current_queue_track_metadata(allow_multi_duration=self._is_per_track)
             )
             active = self._active_media
             self._attr_current_media = PlayerMedia(
@@ -418,12 +512,48 @@ class SoundBridgePlayer(PlayerProtocol):
                 return ""
         return fallback_album
 
-    def _current_queue_track_metadata(self) -> tuple[str, str, str, int | None, bool]:
-        """Return (title, artist, album, duration_seconds, is_single_item) for the active queue."""
+    def _resolve_queue_item(self, queue: Any | None, media: PlayerMedia | None) -> Any | None:
+        """Return the QueueItem matching ``media``, or the queue's current item."""
+        current = queue.current_item if queue else None
+        if media and media.queue_item_id:
+            if current is not None and getattr(current, "queue_item_id", None) in {
+                None,
+                media.queue_item_id,
+            }:
+                return current
+            get_item_fn = getattr(self.mass.player_queues, "get_item", None)
+            if callable(get_item_fn) and media.source_id:
+                item = get_item_fn(media.source_id, media.queue_item_id)
+                if item is not None and isinstance(getattr(item, "name", None), str):
+                    return item
+        return current
+
+    def _current_queue_track_metadata(
+        self,
+        media: PlayerMedia | None = None,
+        *,
+        allow_multi_duration: bool = False,
+    ) -> tuple[str, str, str, int | None, bool]:
+        """Return (title, artist, album, duration_seconds, is_single_item) for ``media``."""
         queue = self._get_active_queue()
-        if not queue or not queue.current_item:
-            return "", "", "", None, False
-        item = queue.current_item
+        is_single_item = bool(queue and queue.items == 1)
+        target_media = media or self._active_media
+        item = self._resolve_queue_item(queue, target_media)
+        if item is None:
+            if target_media is None:
+                return "", "", "", None, False
+            dur = (
+                target_media.duration
+                if (target_media.duration and (is_single_item or allow_multi_duration))
+                else None
+            )
+            return (
+                target_media.title or "",
+                target_media.artist or "",
+                target_media.album or "",
+                dur,
+                is_single_item,
+            )
         media_item = item.media_item
         streamdetails = getattr(item, "streamdetails", None)
         stream_meta = getattr(streamdetails, "stream_metadata", None) if streamdetails else None
@@ -438,8 +568,9 @@ class SoundBridgePlayer(PlayerProtocol):
         album_obj = getattr(media_item, "album", None) if media_item else None
         album = sm_album or (getattr(album_obj, "name", None) or "")
 
-        # Only expose duration when there is a single track in the queue: in flow mode
-        # trackLength is locked at QueueAndPlayOne time for the continuous stream.
-        is_single_item = queue.items == 1
-        duration = item.duration if (item.duration and is_single_item) else None
+        # In continuous flow mode, trackLength is locked at QueueAndPlayOne time for the
+        # whole stream; per-track /single/ streams and single-item queues report track duration.
+        duration = (
+            item.duration if (item.duration and (is_single_item or allow_multi_duration)) else None
+        )
         return title, artist, album, duration, is_single_item

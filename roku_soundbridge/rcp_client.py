@@ -14,6 +14,7 @@ _LOGGER = logging.getLogger(__name__)
 
 RCP_PORT = 5555
 _INTERNET_RADIO_SERVER = "internet radio"
+_UNCOMPRESSED_FORMATS: frozenset[str] = frozenset({"WAV", "AIFF", "LPCM"})
 
 _ERROR_VALUES = frozenset(
     {
@@ -181,6 +182,8 @@ class RcpClient:
         album: str = "",
         fmt: str = "WAV",
         length_ms: int | None = None,
+        *,
+        remote_stream: bool | None = None,
     ) -> None:
         """
         Push a stream URL to the device and start playing.
@@ -189,7 +192,9 @@ class RcpClient:
         PlayStation command. Setting ``format`` explicitly avoids the
         SoundBridge's content-type probing, which is unreliable for
         chunked-encoded WAV with no Content-Length. ``remoteStream=1`` marks
-        the URL as an endless stream so the device does not loop on EOF.
+        compressed streams as endless ICY radio broadcasts, whereas uncompressed
+        formats (``WAV``, ``AIFF``, ``LPCM``) omit ``remoteStream=1`` by default
+        because SoundBridge firmware rejects WAV with ``remoteStream 1``.
 
         All commands are pipelined into a single TCP send so the device can
         process the whole sequence without per-command round-trips.
@@ -200,14 +205,19 @@ class RcpClient:
         :param album: Album name to display (when not relying on in-stream ICY).
         :param fmt: Audio format token (e.g. ``MP3``, ``WAV``, ``AAC``, ``AIFF``).
         :param length_ms: Track length in milliseconds, if known.
+        :param remote_stream: Optional override for sending ``SetWorkingSongInfo remoteStream 1``.
         """
         self._clear_song_state()
+        use_remote_stream = (
+            (fmt.upper() not in _UNCOMPRESSED_FORMATS) if remote_stream is None else remote_stream
+        )
         commands = [
             "ClearWorkingSong",
             f"SetWorkingSongInfo url {_sanitize_value(url)}",
             f"SetWorkingSongInfo format {_sanitize_value(fmt)}",
-            "SetWorkingSongInfo remoteStream 1",
         ]
+        if use_remote_stream:
+            commands.append("SetWorkingSongInfo remoteStream 1")
         if sanitized_title := _sanitize_value(title):
             commands.append(f"SetWorkingSongInfo title {sanitized_title}")
         if sanitized_artist := _sanitize_value(artist):
