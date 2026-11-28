@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from music_assistant_models.enums import (
+    ContentType,
     EventType,
     IdentifierType,
     MediaType,
@@ -17,7 +18,8 @@ from music_assistant_models.event import MassEvent
 from music_assistant_models.player import PlayerMedia
 from zeroconf import ServiceStateChange
 
-from music_assistant.constants import CONF_ENABLE_ICY_METADATA, CONF_OUTPUT_CODEC
+from music_assistant import constants as ma_constants
+from music_assistant.constants import CONF_ENABLE_ICY_METADATA
 from roku_soundbridge.player import SoundBridgePlayer
 from roku_soundbridge.provider import (
     CONF_MANUAL_IPS,
@@ -165,6 +167,23 @@ async def test_removing_player_prunes_manual_host_entry() -> None:
     )
 
 
+# servers up to 2.11 have an output codec setting, newer ones a playback quality setting
+_CONF_OUTPUT_CODEC: str | None = getattr(ma_constants, "CONF_OUTPUT_CODEC", None)
+_PLAYBACK_QUALITY: Any = getattr(ma_constants, "PlaybackQuality", None)
+
+
+def _assert_mp3_default(player: SoundBridgePlayer, by_key: dict[str, Any]) -> None:
+    """Assert the player streams MP3 by default under the server's codec setting."""
+    if _CONF_OUTPUT_CODEC is not None:
+        assert by_key[_CONF_OUTPUT_CODEC].default_value == "mp3"
+    if _PLAYBACK_QUALITY is not None:
+        assert player.playback_quality_codecs == {
+            _PLAYBACK_QUALITY.LOSSLESS_UNCOMPRESSED: ContentType.WAV,
+            _PLAYBACK_QUALITY.COMPRESSED: ContentType.MP3,
+        }
+        assert player.default_playback_quality == _PLAYBACK_QUALITY.COMPRESSED
+
+
 async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
     """SoundBridgePlayer defaults to MP3+basic ICY, skips RCP title on MP3, and pushes WAV metadata."""
     provider, mass = _make_mock_provider()
@@ -198,11 +217,14 @@ async def test_player_defaults_mp3_icy_and_play_media_modes() -> None:
 
     entries = await player.get_config_entries()
     by_key = {entry.key: entry for entry in entries}
-    assert by_key[CONF_OUTPUT_CODEC].default_value == "mp3"
     assert by_key[CONF_ENABLE_ICY_METADATA].default_value == "basic"
+    _assert_mp3_default(player, by_key)
 
     await player.on_config_updated()
-    assert mass.config.get_protocol_value("soundbridge_192_168_1_50", CONF_OUTPUT_CODEC) == "mp3"
+    if _CONF_OUTPUT_CODEC is not None:
+        assert (
+            mass.config.get_protocol_value("soundbridge_192_168_1_50", _CONF_OUTPUT_CODEC) == "mp3"
+        )
     assert (
         mass.config.get_protocol_value("soundbridge_192_168_1_50", CONF_ENABLE_ICY_METADATA)
         == "basic"

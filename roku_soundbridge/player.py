@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
+    ContentType,
     EventType,
     IdentifierType,
     PlaybackState,
@@ -15,12 +16,8 @@ from music_assistant_models.enums import (
 )
 from music_assistant_models.player import DeviceInfo, PlayerMedia
 
-from music_assistant.constants import (
-    CONF_ENABLE_ICY_METADATA,
-    CONF_ENTRY_ENABLE_ICY_METADATA,
-    CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3,
-    CONF_OUTPUT_CODEC,
-)
+from music_assistant import constants as ma_constants
+from music_assistant.constants import CONF_ENABLE_ICY_METADATA, CONF_ENTRY_ENABLE_ICY_METADATA
 from music_assistant.models.player_protocol import PlayerProtocol
 
 from .rcp_client import RcpClient
@@ -43,6 +40,15 @@ if TYPE_CHECKING:
 _CONF_ENTRY_ICY_METADATA_BASIC = ConfigEntry.from_dict(
     {**CONF_ENTRY_ENABLE_ICY_METADATA.to_dict(), "default_value": "basic"}
 )
+
+# Servers up to 2.11 pick the stream codec from an output codec setting; newer servers replaced
+# it with a playback quality setting that the protocol maps to codecs. Both are looked up at
+# runtime so one release loads on either.
+_CONF_OUTPUT_CODEC: str | None = getattr(ma_constants, "CONF_OUTPUT_CODEC", None)
+_CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3: ConfigEntry | None = getattr(
+    ma_constants, "CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3", None
+)
+_PlaybackQuality: Any = getattr(ma_constants, "PlaybackQuality", None)
 
 _TRANSPORT_TO_PLAYBACK = {
     "play": PlaybackState.PLAYING,
@@ -117,9 +123,26 @@ class SoundBridgePlayer(PlayerProtocol):
         """Return polling interval in seconds (faster while playing)."""
         return 10 if self._attr_playback_state == PlaybackState.PLAYING else 30
 
+    @property
+    def playback_quality_codecs(self) -> dict[Any, ContentType]:
+        """Return the codec for each playback quality level the SoundBridge can play."""
+        if _PlaybackQuality is None:
+            return {}
+        return {
+            _PlaybackQuality.LOSSLESS_UNCOMPRESSED: ContentType.WAV,
+            _PlaybackQuality.COMPRESSED: ContentType.MP3,
+        }
+
+    @property
+    def default_playback_quality(self) -> Any:
+        """Return the playback quality level to use when the user picked none."""
+        return None if _PlaybackQuality is None else _PlaybackQuality.COMPRESSED
+
     async def get_config_entries(self) -> list[ConfigEntry]:
         """Return player-level config entries overriding codec and ICY defaults."""
-        return [CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3, _CONF_ENTRY_ICY_METADATA_BASIC]
+        if _CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3 is None:
+            return [_CONF_ENTRY_ICY_METADATA_BASIC]
+        return [_CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3, _CONF_ENTRY_ICY_METADATA_BASIC]
 
     async def on_config_updated(self) -> None:
         """
@@ -129,12 +152,13 @@ class SoundBridgePlayer(PlayerProtocol):
         the streams controller reads ``CONF_ENABLE_ICY_METADATA`` via
         ``get_protocol_value``, which only returns explicitly stored values.
         Writing defaults on first attach ensures ICY headers are active immediately
-        without overwriting any explicit user choice.
+        without overwriting any explicit user choice. Servers with a playback quality
+        setting take MP3 from ``default_playback_quality`` instead of a stored codec.
         """
-        for key, default in (
-            (CONF_OUTPUT_CODEC, "mp3"),
-            (CONF_ENABLE_ICY_METADATA, "basic"),
-        ):
+        defaults = [(CONF_ENABLE_ICY_METADATA, "basic")]
+        if _CONF_OUTPUT_CODEC is not None:
+            defaults.insert(0, (_CONF_OUTPUT_CODEC, "mp3"))
+        for key, default in defaults:
             if self.mass.config.get_protocol_value(self.protocol_id, key) is None:
                 self.mass.config.set_protocol_value(self.protocol_id, key, default)
 
