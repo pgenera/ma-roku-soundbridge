@@ -180,7 +180,6 @@ class SoundBridgePlayer(PlayerProtocol):
         for key, default in defaults:
             if self.mass.config.get_protocol_value(self.protocol_id, key) is None:
                 self.mass.config.set_protocol_value(self.protocol_id, key, default)
-        self.__dict__.pop("flow_mode", None)
 
         await self._client.connect()
         self._sync_client_state()
@@ -269,15 +268,17 @@ class SoundBridgePlayer(PlayerProtocol):
         """
         self._enqueued_media = media
 
-    def _sync_icy_for_format(self, fmt: str) -> str:
+    def _sync_icy_for_format(self, fmt: str, *, is_per_track: bool = False) -> str:
         """
         Disable ICY framing for uncompressed streams and restore it for compressed streams.
 
         Music Assistant injects ICY metadata blocks into ``/flow/`` responses whenever
         ``CONF_ENABLE_ICY_METADATA`` is not ``"disabled"``, which corrupts WAV/AIFF/LPCM
-        streams on SoundBridge hardware.
+        streams on SoundBridge hardware. Per-track ``/single/`` streams never send ICY
+        framing, so persisted ICY settings can remain untouched there.
 
         :param fmt: Resolved uppercase stream format token (e.g. ``MP3``, ``WAV``).
+        :param is_per_track: True when streaming a per-track ``/single/`` URL.
         :return: Effective ICY metadata preference after any format adjustment.
         """
         raw_pref = self.mass.config.get_protocol_value(
@@ -285,6 +286,8 @@ class SoundBridgePlayer(PlayerProtocol):
         )
         icy_pref = str(raw_pref) if raw_pref is not None else "basic"
         if fmt.upper() in _UNCOMPRESSED_FORMATS:
+            if is_per_track:
+                return "disabled"
             if icy_pref != "disabled":
                 self._saved_icy_pref = icy_pref
                 self.logger.info(
@@ -328,7 +331,7 @@ class SoundBridgePlayer(PlayerProtocol):
         queue_title, queue_artist, queue_album, queue_duration, _is_single_item = (
             self._current_queue_track_metadata(media, allow_multi_duration=is_per_track)
         )
-        icy_pref = self._sync_icy_for_format(fmt)
+        icy_pref = self._sync_icy_for_format(fmt, is_per_track=is_per_track)
         use_icy = fmt == "MP3" and icy_pref != "disabled"
 
         # When ICY StreamTitle arrives, SoundBridge firmware shifts the initial

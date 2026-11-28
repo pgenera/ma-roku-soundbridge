@@ -524,6 +524,10 @@ async def test_player_wav_requires_no_flow_mode_and_enqueue_handoff() -> None:
         ]
     )
     await player.play_media(media1)
+    assert (
+        mass.config.get_protocol_value("soundbridge_192_168_1_50", CONF_ENABLE_ICY_METADATA)
+        == "basic"
+    )
     mock_client.play_url.assert_awaited_once_with(
         "http://192.168.1.10:8097/single/session/qi_1/player.wav",
         title="007",
